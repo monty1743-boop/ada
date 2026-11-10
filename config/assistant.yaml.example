@@ -1,0 +1,43 @@
+# Merge these keys into ~/.hermes/config.yaml after Hermes is installed.
+# Point base_url at the Cursor proxy from the README. The proxy holds the key.
+# Hermes sends the literal api_key below; the proxy in this setup does not check it.
+
+model:
+  default: "auto"
+  provider: "custom"
+  base_url: "http://127.0.0.1:8080/v1"
+  api_key: "local"
+  context_length: 128000
+
+stt:
+  enabled: true
+  provider: "local"
+  language: "en"
+  local:
+    model: "small"
+
+tts:
+  provider: edge
+  edge:
+    voice: en-US-AriaNeural
+
+discord:
+  require_mention: false
+  auto_thread: false
+  free_response_channels: ""
+  voice_channel_inactivity_timeout_seconds: 0
+  voice_fx:
+    enabled: false
+
+voice:
+  auto_tts: true
+
+# Empty list would disable tools. This set can read, search, and run a shell
+# when the owner asks. It cannot send mail.
+platform_toolsets:
+  discord: [terminal, file, web, skills, memory, todo]
+
+compression:
+  # Do not make a spoken turn wait out a long summary. One second is enough
+  # for a summary that is already almost done. The rest is adopted later.
+  hygiene_max_turn_hold_seconds: 1

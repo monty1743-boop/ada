@@ -1,0 +1,232 @@
+diff --git a/gateway/run_turn.py b/gateway/run_turn.py
+index 99d28e69cb..74cd011f5a 100644
+--- a/gateway/run_turn.py
++++ b/gateway/run_turn.py
+@@ -1930,9 +1930,15 @@ class GatewayTurnMixin:
+         _streaming_tts_done = adapter is not None and bool(
+             getattr(adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation)
+         )
+-        if not _streaming_tts_done and self._should_send_voice_reply(
++        _house_will_speak = not _streaming_tts_done and self._should_send_voice_reply(
+             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
+-        ):
++        )
++        try:
++            from gateway.house_hold import finish_house_hold
++            await finish_house_hold(session_key, run_generation, speak_answer=_house_will_speak)  # house-watch
++        except Exception:
++            logger.debug("house hold finish failed", exc_info=True)
++        if _house_will_speak:
+             await self._send_voice_reply(event, response)
+ 
+         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
+@@ -3106,6 +3112,11 @@ class GatewayTurnMixin:
+         turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback
+         turn_ctx.native_tool_start_callback = turn_runner.combined_tool_start_callback
+         turn_ctx.native_tool_complete_callback = turn_runner.native_tool_complete_callback
++        try:
++            from gateway.house_hold import maybe_start_house_hold
++            maybe_start_house_hold(self, turn_ctx)  # house-watch
++        except Exception:
++            logger.debug("house hold start failed", exc_info=True)
+         return turn_ctx, turn_runner, _cleanup_adapter
+ 
+     def _thread_metadata_for_progress(
+diff --git a/gateway/run_voice.py b/gateway/run_voice.py
+index 3b3242d8b3..cb54944cfc 100644
+--- a/gateway/run_voice.py
++++ b/gateway/run_voice.py
+@@ -177,17 +177,26 @@ class GatewayVoiceMixin:
+         if not success:
+             adapter._voice_input_callback = None
+             return t("gateway.voice.channel_join_permissions")
+-        text_channel_id = int(event.source.chat_id)
+-        # Moving to another text channel drops speech buffered for the old one (a same-channel rejoin
+-        # keeps it); nothing awaits between this and the binding write, so no poll sees the gap.
++        # Replies and transcript echoes belong in the voice channel she joined, not the
++        # text channel where /voice join was typed. That text channel is often public.
++        text_channel_id = int(getattr(voice_channel, "id", None) or event.source.chat_id)
+         previous = adapter._voice_text_channels.get(guild_id)
+         if previous is not None and previous != text_channel_id and hasattr(adapter, "discard_pending_voice_input"):
+             adapter.discard_pending_voice_input(guild_id)
+         adapter._voice_text_channels[guild_id] = text_channel_id
+         if hasattr(adapter, "_voice_sources"):
+-            adapter._voice_sources[guild_id] = event.source.to_dict()
+-        self._apply_voice_mode(adapter, self._voice_key_for_source(event.source),
+-                               event.source.chat_id, "all")
++            source_dict = event.source.to_dict()
++            source_dict["chat_id"] = str(text_channel_id)
++            voice_name = getattr(voice_channel, "name", None)
++            if isinstance(voice_name, str) and voice_name:
++                source_dict["chat_name"] = voice_name
++            adapter._voice_sources[guild_id] = source_dict
++        self._apply_voice_mode(
++            adapter,
++            self._voice_key(Platform.DISCORD, str(text_channel_id), profile=voice_profile),
++            str(text_channel_id),
++            "all",
++        )
+         return t("gateway.voice.channel_joined", name=voice_channel.name)
+ 
+     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
+@@ -265,6 +274,7 @@ class GatewayVoiceMixin:
+                 user_name = source.user_name
+             user_name = user_name or GatewayVoiceMixin._cached_user_display_name(client, user_id)
+             source.user_id, source.user_name = str(user_id), user_name or str(user_id)
++            source.chat_id = str(text_ch_id)
+             # The bound source is the `/voice join` message's; its id is not this turn's trigger
+             # (run.py exports it as HERMES_SESSION_MESSAGE_ID for reply anchoring).
+             source.message_id = None
+diff --git a/plugins/model-providers/custom/__init__.py b/plugins/model-providers/custom/__init__.py
+index 2858553dc8..89cc0d1a51 100644
+--- a/plugins/model-providers/custom/__init__.py
++++ b/plugins/model-providers/custom/__init__.py
+@@ -68,6 +68,9 @@ class CustomProfile(ProviderProfile):
+         # the main loop after the route rejected the reasoning field — an unset main
+         # effort arrives here already filled by default_reasoning_config). Never emit
+         # think=True (Ollama-only flag).
++        # Cursor's auto router 400s on any reasoning_effort value, including "none".
++        if str(ctx.get("model") or "").strip().lower() == "auto":
++            return extra_body, top_level
+         if reasoning_config and isinstance(reasoning_config, dict):
+             effort = (reasoning_config.get("effort") or "").strip().lower()
+             if effort == "none" or reasoning_config.get("enabled", True) is False:
+diff --git a/plugins/platforms/discord/adapter.py b/plugins/platforms/discord/adapter.py
+index 8610268cb3..3675109df8 100644
+--- a/plugins/platforms/discord/adapter.py
++++ b/plugins/platforms/discord/adapter.py
+@@ -704,7 +704,7 @@ class VoiceReceiver:
+     """Captures voice audio from a Discord voice channel: hooks the VoiceClient socket, decrypts
+     RTP (NaCl + DAVE E2EE), decodes Opus per user; a polling loop delivers utterances on silence."""
+ 
+-    SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance
++    SILENCE_THRESHOLD = 0.8    # seconds of silence → end of utterance
+     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
+     SAMPLE_RATE = 48000        # Discord native rate
+     CHANNELS = 2               # Discord sends stereo
+@@ -962,11 +962,15 @@ class VoiceReceiver:
+             )
+         if len(data) < 16:
+             return
+-        # RTP v2: top 2 bits 10 (rest varies); voice payload type (byte 1 & 0x7F) is 0x78.
+-        if (data[0] >> 6) != 2 or (data[1] & 0x7F) != 0x78:
++        # RTP v2. Discord desktop now sends payload types other than the old 0x78
++        # (observed 0x48 and 0x49). Decrypt rejects anything that is not voice.
++        if (data[0] >> 6) != 2:
+             if self._packet_debug_count <= 5:
+                 logger.debug("Skipped non-RTP: byte0=0x%02x byte1=0x%02x", data[0], data[1])
+             return
++        payload_type = data[1] & 0x7F
++        if payload_type != 0x78 and self._packet_debug_count <= 3:
++            logger.info("Voice RTP payload type 0x%02x", payload_type)
+         first_byte = data[0]
+         _, _, seq, _timestamp, ssrc = struct.unpack_from(">BBHII", data, 0)
+         if ssrc == self._bot_ssrc:
+@@ -1058,11 +1062,16 @@ class VoiceReceiver:
+                         user_id, davey.MediaType.audio, decrypted
+                     )
+                 except Exception as e:
+-                    # Unencrypted passthrough — use NaCl-decrypted data as-is
+-                    if "Unencrypted" not in str(e):
++                    # Unencrypted passthrough — use NaCl-decrypted data as-is.
++                    # NoDecryptorForUser means the MLS group has no key for this
++                    # speaker yet; the transport-decrypted frame is still Opus.
++                    err = str(e)
++                    if "Unencrypted" not in err and "NoDecryptorForUser" not in err:
+                         if self._packet_debug_count <= 10:
+                             logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
+                         return
++                    if self._packet_debug_count <= 3:
++                        logger.info("DAVE passthrough for user %s: %s", user_id, err)
+             elif (
+                 dave_pver > 0
+                 and time.monotonic() >= self._dave_passthrough_until
+@@ -1099,7 +1108,7 @@ class VoiceReceiver:
+         except Exception as e:
+             with self._lock:
+                 self._decoders.pop(ssrc, None)
+-            logger.debug("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
++            logger.warning("Opus decode error for SSRC %s; reset decoder: %s", ssrc, e)
+             return
+ 
+     # --- Silence detection ---
+@@ -1263,6 +1272,22 @@ from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesM
+ from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
+ 
+ 
++_ADA_WAKE_RE = re.compile(
++    r"^(?:(?:hey|hi|ok|okay|yo)\b[\s,]*)?ada\b[\s,!.?:;\-]*",
++    re.IGNORECASE,
++)
++
++
++def _ada_wake_command(transcript: str) -> str | None:
++    """Return the request after a leading Ada, or None when she was not called."""
++    spoken = (transcript or "").strip()
++    match = _ADA_WAKE_RE.match(spoken)
++    if not match:
++        return None
++    rest = spoken[match.end():].strip(" \t,.:;-")
++    return rest or "Ada"
++
++
+ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceInfoMixin, DiscordSlashAuthMixin,
+                      BasePlatformAdapter):
+     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
+@@ -1549,6 +1574,11 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
+             @self._client.event
+             async def on_ready():
+                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
++                try:
++                    from gateway.house_hold import start_announce_server
++                    start_announce_server(adapter_self)  # house-watch
++                except Exception:
++                    logger.debug("watch announce server failed", exc_info=True)
+                 await adapter_self._resolve_allowed_usernames()
+                 adapter_self._ready_event.set()
+                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
+@@ -4039,6 +4069,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
+         vc = self._voice_clients.get(guild_id)
+         return vc is not None and vc.is_connected()
+ 
++
+     # --- Voice listening (Phase 2) ---
+ 
+     # UDP keepalive interval; Discord drops the UDP route after ~60s of silence.
+@@ -4061,6 +4092,18 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
+             while receiver._running:
+                 await asyncio.sleep(0.2)
+                 now = time.monotonic()
++                if now - getattr(self, "_voice_stat_at", {}).get(guild_id, 0) >= 5:
++                    self._voice_stat_at = getattr(self, "_voice_stat_at", {})
++                    self._voice_stat_at[guild_id] = now
++                    logger.info(
++                        "Voice stats guild=%s packets=%d decoded=%d decrypt_fail=%d dave_drop=%d buffered=%d",
++                        guild_id,
++                        receiver._packet_debug_count,
++                        receiver._decode_ok,
++                        receiver._decode_failed,
++                        receiver._dave_unmapped_dropped,
++                        sum(len(b) for b in list(receiver._buffers.values())),
++                    )
+                 if now - last_keepalive >= self._KEEPALIVE_INTERVAL:
+                     last_keepalive = now
+                     try:
+@@ -4096,10 +4139,17 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
+             from tools.transcription_tools import transcribe_audio
+             result = await asyncio.to_thread(transcribe_audio, wav_path)
+             if not result.get("success"):
++                logger.warning("Voice transcription failed: %s", result.get("error"))
+                 return
+             transcript = result.get("transcript", "").strip()
++            logger.info("Voice transcript from user %d: %r", user_id, transcript[:200])
+             if not transcript or is_whisper_hallucination(transcript):
+                 return
++            addressed = _ada_wake_command(transcript)
++            if addressed is None:
++                logger.info("Voice ignored, not addressed: %r", transcript[:120])
++                return
++            transcript = addressed
+             logger.info("Voice input from user %d: %s", user_id, transcript[:100])
+             if getattr(self, "_voice_text_channels", {}).get(guild_id) != captured_for:
+                 logger.info("Dropping voice input from user %d: binding moved during transcription", user_id)
